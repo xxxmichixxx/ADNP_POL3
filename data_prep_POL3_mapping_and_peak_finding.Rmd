@@ -1,0 +1,385 @@
+---
+title: "POL3 ChIP mapping and peak finding"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+
+# find POL3 peaks using MACS3
+
+ChIP:
+Pol3_ChIP_AdnpFKBP_ctrl_r1
+Pol3_ChIP_AdnpFKBP_ctrl_r2
+Pol3_ChIP_AdnpFKBP_4h_r1
+Pol3_ChIP_AdnpFKBP_4h_r2
+Pol3_ChIP_AdnpFKBP_24h_r1
+Pol3_ChIP_AdnpFKBP_24h_r2
+
+Input:
+Input_AdnpFKBP
+
+
+```{bash}
+cd /michi/Projects/Adnp/Pol3_mm39/manuscript
+bamdir=/deepSeqData/bam
+module purge
+module load MACS3/3.0.1
+
+macs3 callpeak -t \
+${bamdir}/Pol3_ChIP_AdnpFKBP_ctrl_r1_3597F1_RS_multi.bam \
+${bamdir}/Pol3_ChIP_AdnpFKBP_ctrl_r2_3597F2_RS_multi.bam \
+${bamdir}/Pol3_ChIP_AdnpFKBP_4h_r1_3597F3_RS_multi.bam \
+${bamdir}/Pol3_ChIP_AdnpFKBP_4h_r2_3597F4_RS_multi.bam \
+${bamdir}/Pol3_ChIP_AdnpFKBP_24h_r1_3597F5_RS_multi.bam \
+${bamdir}/Pol3_ChIP_AdnpFKBP_24h_r2_3597F6_RS_multi.bam \
+-f BAMPE -g mm --outdir peaks -n Pol3_AdnpDTAGs
+
+###@ #run peakfinding without model
+###@ macs3 callpeak -t \
+###@ ${bamdir}/Pol3_ChIP_AdnpFKBP_ctrl_r1_3597F1_RS_multi.bam \
+###@ ${bamdir}/Pol3_ChIP_AdnpFKBP_ctrl_r2_3597F2_RS_multi.bam \
+###@ ${bamdir}/Pol3_ChIP_AdnpFKBP_4h_r1_3597F3_RS_multi.bam \
+###@ ${bamdir}/Pol3_ChIP_AdnpFKBP_4h_r2_3597F4_RS_multi.bam \
+###@ ${bamdir}/Pol3_ChIP_AdnpFKBP_24h_r1_3597F5_RS_multi.bam \
+###@ ${bamdir}/Pol3_ChIP_AdnpFKBP_24h_r2_3597F6_RS_multi.bam \
+###@ -f BAMPE -g mm --outdir peaks -n Pol3_AdnpDTAGs --nomodel --outdir peaks_v2
+###@ 
+###@ # ==> with and without model is 100% identical!!!
+
+###@ #run peakfinding without model only for wt (tried this and got ~3000 peaks which is in the range of the filtered peaks ~3400 for ctrl when doing all together. so let's keep the all ###@ together peakfinding!)
+###@ macs3 callpeak -t \
+###@ ${bamdir}/Pol3_ChIP_AdnpFKBP_ctrl_r1_3597F1_RS_multi.bam \
+###@ ${bamdir}/Pol3_ChIP_AdnpFKBP_ctrl_r2_3597F2_RS_multi.bam \
+###@ -f BAMPE -g mm --outdir peaks -n Pol3_AdnpDTAG_s_0h --nomodel --outdir peaks_v2
+
+```
+
+# calculate ChIP/Input enrichments in peaks and filter out peaks with low enrichments
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(MiniChip)
+  library(GenomicFeatures)
+  library(Rsamtools)
+  library(viridis)
+  library(cowplot)
+  library(Rsubread)
+})
+
+#parameters
+#topdir <-  "../"
+topdir <- "/michi/Projects/Adnp/Pol3_mm39/manuscript"
+datadir <- "data"
+bamdir <- "/deepSeqData/bam"
+
+genome_file <- "/bioinfo/Genomes/mm39/mm39.fa"
+chrsizes_file <-"/bioinfo/Genomes/mm39/starIndex_v2_7_3a_mm39.woGTF/chrNameLength.txt"
+repeat_file <- "/bioinfo/Annotations/mm39/repeat_masker_s/GRCm39.primary_assembly.repMasker_sesitive.bed"
+
+```
+
+### load peaks and center them arround summit
+
+```{r peaks}
+peaks.df <- read.table(file.path(topdir,"peaks/Pol3_AdnpDTAGs_peaks.narrowPeak"),header=F)
+names(peaks.df) <- c("chr","start","end","name","score","empty","foldchange","pvalue","qvalue","summit")
+peaks <- makeGRangesFromDataFrame(peaks.df,
+                                   keep.extra.columns=TRUE,
+                                   ignore.strand=TRUE,
+                                   seqinfo=NULL,
+                                   seqnames.field=c("chr"),
+                                   start.field=c("start"),
+                                   end.field=c("end"),
+                                   starts.in.df.are.0based=TRUE)
+
+
+#remove peaks > 5kb
+plot(density(width(peaks)))
+peaks <- peaks[width(peaks) < 5001]
+
+#center peaks on summit
+start(peaks) <- start(peaks) + peaks$summit
+end(peaks) <- start(peaks)
+peaks <- resize(peaks,width=300L, fix="center")
+names(peaks) <- peaks$name
+
+#remove peaks that extend over the edge of chromosome
+chr_sizes <- read.table(chrsizes_file)
+chr_sizes$start <- 1
+chr_sizes <- makeGRangesFromDataFrame(chr_sizes,
+                                   keep.extra.columns=TRUE,
+                                   ignore.strand=TRUE,
+                                   seqinfo=NULL,
+                                   seqnames.field=c("V1"),
+                                   start.field=c("start"),
+                                   end.field=c("V2"),
+                                   starts.in.df.are.0based=FALSE)
+peaks <- peaks[overlapsAny(peaks,chr_sizes,minoverlap = 50)==TRUE]
+common_levels <- seqlevels(peaks)[seqlevels(peaks) %in% seqlevels(chr_sizes)]
+peaks <- keepSeqlevels(peaks,value = common_levels)
+
+```
+
+### calculate read counts in peaks for ChIPs and Inputs
+
+```{r counts}
+#get bam files
+bamFiles <- list.files(bamdir,pattern = "_RS_multi.bam$",full.names = TRUE)
+#bamFiles <- c(grep("Pol3_ChIP_AdnpFKBP_",bamFiles,value=TRUE),grep("Adnp_P3_In_AdnpFKBP_",bamFiles,value=TRUE)) # using corresponding input
+bamFiles <- c(grep("Pol3_ChIP_AdnpFKBP_",bamFiles,value=TRUE),grep("Input_AGBTP_merged",bamFiles,value=TRUE)) # using combined Inputs of all ChIPs for ms
+bamFiles
+
+bamNames <- gsub("/deepSeqData/bam/","",bamFiles)
+bamNames <- gsub("_RS_multi.bam","",bamNames)
+bamNames
+
+#saf table for featureCounts
+saf <- data.frame(GeneID= names(peaks), Chr=seqnames(peaks),
+                  Start=start(peaks), End=end(peaks),Strand=strand(peaks),Score=peaks$score)
+
+f_counts <- featureCounts(bamFiles,annot.ext=saf,isGTFAnnotationFile = FALSE,
+                          useMetaFeatures=FALSE,allowMultiOverlap=TRUE,
+                          minOverlap=1,countMultiMappingReads=FALSE,fraction=TRUE,
+                          minMQS=255,strandSpecific=0,nthreads=24,verbose=FALSE,isPairedEnd=TRUE)
+
+fcounts <- data.frame(f_counts$counts)
+colnames(fcounts) <- bamNames
+
+
+
+```
+
+### normalize counts to total mapped read numbers (cpm)
+
+```{r cpmNormalisation}
+#calculate CPMs
+cpm <- f_counts$counts
+
+#normalize to 1 mio mappers per library
+columns = c("libs","mapped_reads") 
+mapped_reads_df = data.frame(matrix(nrow = length(bamNames), ncol = length(columns))) 
+colnames(mapped_reads_df) = columns
+mapped_reads_df$libs <- bamNames
+
+i=1
+for (i in seq_along(bamFiles)){
+  mapped_reads <- sum(f_counts$stat[f_counts$stat$Status=="Assigned" | f_counts$stat$Status=="Unassigned_NoFeatures",i+1])
+  mapped_reads_df$mapped_reads[i] <- mapped_reads
+  scaling_factor <-  mapped_reads/1e6
+  cpm[,i] <- f_counts$counts[,i]/scaling_factor
+  i = i+1
+}
+
+
+cpm <- data.frame(cpm)
+colnames(cpm) <- bamNames
+cpmOriginal <- cpm
+
+save(cpm,file=file.path(topdir,datadir,"Pol3_allpeaks_cpms_mq255.RData"))
+
+```
+
+
+### calculate ChIP/Input enrichment
+
+```{r enrichments}
+Pol3_enr <- log2((cpm[,grep("^Pol3",colnames(cpm))]+1)/(cpm[,"Input_AGBTP_merged"]+1))
+                 
+Pol3_cpmsum <- cpm[,grep("^Pol3",colnames(cpm))]+cpm[,"Input_AGBTP_merged"]
+
+
+plot(density((Pol3_enr[,1])))               
+abline(v=log2(1.2),col="green")
+abline(v=log2(2),col="darkgreen")
+
+
+```
+
+### filter peaks based on enrichment (more than 1.2 fold enriched in at least 2 replicates) and ChIP cpm > 1
+
+```{r filter}
+Pol3_enr1.2 <- Pol3_enr > log2(1.2)
+peaks$Pol3_ctrl_enr <- rowSums(Pol3_enr1.2[,c("Pol3_ChIP_AdnpFKBP_ctrl_r1_3597F1", "Pol3_ChIP_AdnpFKBP_ctrl_r2_3597F2" )]) >=2 & rowMeans(cpm[,c("Pol3_ChIP_AdnpFKBP_ctrl_r1_3597F1", "Pol3_ChIP_AdnpFKBP_ctrl_r2_3597F2" )]) > 1
+peaks$Pol3_4h_enr <- rowSums(Pol3_enr1.2[,c("Pol3_ChIP_AdnpFKBP_4h_r1_3597F3", "Pol3_ChIP_AdnpFKBP_4h_r2_3597F4" )]) >=2 & rowMeans(cpm[,c("Pol3_ChIP_AdnpFKBP_4h_r1_3597F3", "Pol3_ChIP_AdnpFKBP_4h_r2_3597F4" )]) > 1
+peaks$Pol3_24h_enr <- rowSums(Pol3_enr1.2[,c("Pol3_ChIP_AdnpFKBP_24h_r1_3597F5", "Pol3_ChIP_AdnpFKBP_24h_r2_3597F6" )]) >=2  & rowMeans(cpm[,c("Pol3_ChIP_AdnpFKBP_24h_r1_3597F5", "Pol3_ChIP_AdnpFKBP_24h_r2_3597F6" )]) > 1
+
+
+library(UpSetR)
+peaks4upset <- data.frame(as.matrix(data.frame(mcols(peaks)[,8:10]))*1)
+pdf(file.path(topdir,"plots",sprintf("Pol3_peaks_overlaps_%d_AdnpFKBP_24h_%d_peaks_withoutADNP.pdf",sum(peaks4upset$AdnpFKBP_24h_enr),nrow(peaks4upset))),height=5,width=5)
+upset(peaks4upset,nsets = 3, nintersects = 10, set_size.show = TRUE, order.by= "freq")
+dev.off()
+
+Pol3_Peaks_filtered <- peaks[rowSums(peaks4upset) > 0]
+Pol3_enr_filtered <- Pol3_enr[rowSums(peaks4upset) > 0,]
+
+
+###@ #compare to old peaks 
+###@ old_filtered_peaks <- readRDS(file = file.path(topdir,datadir, "POL3_Peaks_filtered_1.2foldEnr_mq255.rds"))
+###@ makeVennDiagram(Peaks=list(Pol3_Peaks_filtered,old_filtered_peaks), NameOfPeaks = c("new","old") ,totalTest = 10000)
+
+```
+
+### save the peaks
+
+```{r}
+mcols(Pol3_Peaks_filtered) <- cbind(mcols(Pol3_Peaks_filtered),Pol3_enr_filtered)
+saveRDS(object = Pol3_Peaks_filtered, file = file.path(topdir,datadir, "POL3_Peaks_filtered_1.2foldEnr_mq255.rds"))
+#save as bed file
+Pol3_Peaks_filtered_bed <- data.frame(chr=seqnames(Pol3_Peaks_filtered),start=start(Pol3_Peaks_filtered)-1,end=end(Pol3_Peaks_filtered),
+           names=Pol3_Peaks_filtered$name,
+                 scores=Pol3_Peaks_filtered$score,
+                 strands=strand(Pol3_Peaks_filtered))
+write.table(Pol3_Peaks_filtered_bed, file=file.path(topdir,"peaks/POL3_Peaks_filtered_1.2foldEnr_mq255.bed"), quote=F, sep="\t", row.names=F, col.names=F)
+
+```
+
+
+# intersect peaks with repeat and gene annotations
+```{r}
+# libs
+require(TxDb.Mmusculus.GENCODE.GRCm39.gencodeM34)
+require(rtracklayer)
+
+#load peaks
+peaks <- readRDS(file = file.path(topdir,datadir, "POL3_Peaks_filtered_1.2foldEnr_mq255.rds"))
+
+# get gene symbols for Gencode M34
+GFF <- readGFF("/bioinfo/Genomes/mm39/Gencode_GRCm39_M34/gencode.vM34.primary_assembly.annotation.gtf")
+gene_names <- unique(GFF[,c(9:11)])
+# add as metacolumns
+genes <- genes(TxDb.Mmusculus.GENCODE.GRCm39.gencodeM34)
+mcols(genes) <- merge(mcols(genes),gene_names)
+# check if order was maintained
+identical(names(genes),genes$gene_id)
+
+# get out protein coding genes and non-coding RNAs
+genesProt <- genes[genes$gene_type=="protein_coding"]
+ncRNAs <- genes[ grepl("RNA",genes$gene_type)]
+genebodies <- genesProt[width(genesProt)>200]
+start(genebodies) <- start(genebodies)+200
+
+# get out TSSs
+TSSgenes <- promoters(genesProt,upstream=800, downstream=200)
+TSSnc <- promoters(ncRNAs,upstream=800, downstream=200)
+TSSs <- c(TSSgenes,TSSnc[!overlapsAny(TSSnc,TSSgenes)])
+
+# add metacolumns to merge with rep masker annotations
+TSSs$repeat_class <- "TSS"
+TSSs$repeat_family <- "TSS"
+TSSs$repeat_classfam <- "TSS/TSS"
+names(mcols(TSSs))[6] <- "repeat_class/family"
+TSSs$percDiv <- 100
+TSSs$percDel <- 1000
+TSSs$percIns <- 1000
+
+
+#load repeat annotations from repeat masker
+repeats <- read.delim(repeat_file,header=FALSE)
+names(repeats) <- c("chr","start","end","repeat_name","swScore","strand","repeat_class","repeat_family","percDiv","percDel","percIns","repeat_class/family")
+reps <- makeGRangesFromDataFrame(repeats,
+                                 keep.extra.columns=TRUE,
+                                 ignore.strand=FALSE,
+                                 seqinfo=NULL,
+                                 seqnames.field=c("chr"),
+                                 start.field=c("start"),
+                                 end.field=c("end"),
+                                 strand.field=c("strand"),
+                                 starts.in.df.are.0based=TRUE)
+
+
+#combine annotations
+annot <- c(reps,TSSs)
+
+#remove chromosomes not in combined genome
+chr_sizes <- read.table(chrsizes_file)
+chr_sizes$start <- 1
+chr_sizes <- makeGRangesFromDataFrame(chr_sizes,
+                                   keep.extra.columns=TRUE,
+                                   ignore.strand=TRUE,
+                                   seqinfo=NULL,
+                                   seqnames.field=c("V1"),
+                                   start.field=c("start"),
+                                   end.field=c("V2"),
+                                   starts.in.df.are.0based=FALSE)
+annot <- annot[overlapsAny(annot,chr_sizes,minoverlap = 1)==TRUE]
+
+
+#select the repeats that overlap peaks
+peaks2reps <- findOverlaps(resize(peaks,width=50,fix="center"),annot,ignore.strand=TRUE)
+peaks.reps <- peaks[from(peaks2reps)]
+reps.peaks <- annot[to(peaks2reps)]
+reps.peaks$peakID <- names(peaks.reps)
+
+# remove the repeats that overlap the same peak, keep the onles that have a low percDiv and percIns and percDel
+dup.peakIDs <- unique(reps.peaks$peakID[duplicated(reps.peaks$peakID)])
+
+reps.peaks$score <- reps.peaks$percDiv*2 + reps.peaks$percDel + reps.peaks$percIns
+uni.reps.peaks <- reps.peaks[reps.peaks$peakID %in% dup.peakIDs ==FALSE]
+
+dup.reps.peaks <- lapply(dup.peakIDs,function(dup.peakIDs){
+  sel.reps <- reps.peaks[reps.peaks$peakID==dup.peakIDs]
+  sel.reps[sel.reps$score < (min(sel.reps$score)+0.01)]
+#  sel.reps[sel.reps$score < (min(sel.reps$score)+5)]
+})
+
+#keep only one match, drop others as it is impossible to distinguish anyways
+dup.reps.peaksGR <- do.call("c",dup.reps.peaks)
+dups <- dup.reps.peaksGR$peakID[duplicated(dup.reps.peaksGR$peakID)]
+dup.reps.peaksGR.uni <- dup.reps.peaksGR[duplicated(dup.reps.peaksGR$peakID)==FALSE]
+uni.reps.peaks <- c(uni.reps.peaks,dup.reps.peaksGR.uni)
+summary(as.factor(duplicated(uni.reps.peaks$peakID)))
+
+#add the repeat name, family, class, divergence to peaks GRanges
+peaks$peakID <- names(peaks)
+peaks.df <- left_join(data.frame(peaks),data.frame(mcols(uni.reps.peaks)[,c(1,3,4,5,12)]),by="peakID")
+peaks_wth_reps <- makeGRangesFromDataFrame(peaks.df[,-4],
+                                 keep.extra.columns=TRUE,
+                                 ignore.strand=FALSE,
+                                 seqinfo=NULL,
+                                 seqnames.field=c("seqnames"),
+                                 start.field=c("start"),
+                                 end.field=c("end"),
+                                 strand.field = c("strand"),
+                                 starts.in.df.are.0based=FALSE)
+peaks_wth_reps$repclass <- ifelse(is.na(peaks_wth_reps$repeat_class),"non_repeat",
+                              ifelse(grepl("^DNA",peaks_wth_reps$repeat_class),"DNA",
+                                ifelse(grepl("^TSS",peaks_wth_reps$repeat_class),"TSS",
+                                  ifelse(grepl("RNA",peaks_wth_reps$repeat_class) & peaks_wth_reps$repeat_class !="tRNA","ncRNA",
+                                     ifelse(grepl("^tRNA",peaks_wth_reps$repeat_class),"tRNA",
+                                        ifelse(grepl("^LINE",peaks_wth_reps$repeat_class),"LINE",
+                                           ifelse(grepl("^LTR",peaks_wth_reps$repeat_class),"LTR",
+                                                ifelse(grepl("^SINE",peaks_wth_reps$repeat_class),"SINE",
+                                                       ifelse(grepl("Satellite",peaks_wth_reps$repeat_class),"Satellite",
+                                                              ifelse(peaks_wth_reps$repeat_class=="Simple_repeat" | peaks_wth_reps$repeat_class=="Low_complexity","Simple/low_complexity","other"))))))))))
+
+#check if there is no duplicated peaks
+peaks_wth_reps[duplicated(peaks_wth_reps$peakID)]
+
+saveRDS(object = peaks_wth_reps, file = file.path(topdir,datadir, "POL3_Peaks_filtered_1.2foldEnr_mq255_repAnnotated.rds"))
+
+summary(as.factor(peaks_wth_reps$repclass))
+summary(as.factor(peaks_wth_reps$repeat_name[peaks_wth_reps$Pol3_24h_enr]))
+
+```
+
+
+
+# check some stats for reporting summary
+
+```{r}
+Pol3_Peaks_filtered <- readRDS(file = file.path(topdir,datadir, "POL3_Peaks_filtered_1.2foldEnr_mq255.rds"))
+Pol3_Peaks_filtered[Pol3_Peaks_filtered$qvalue > -log10(0.05)]
+Pol3_Peaks_filtered[Pol3_Peaks_filtered$foldchange > 5]
+```
+
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```
+

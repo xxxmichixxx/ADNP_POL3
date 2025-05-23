@@ -1,0 +1,423 @@
+---
+title: "Pol3 repeat element overlap"
+author: Michaela Schwaiger
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r Sys.Date()`"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+options(width = 90L)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(GenomicFeatures)
+  library(Biostrings)
+  library(UpSetR)
+  library(cowplot)
+  library(ggrepel)
+  library(MiniChip)
+  library(ggplot2)
+})
+
+
+#parameters
+topdir <- "/michi/Projects/Adnp/Pol3_mm39/manuscript"
+datadir <- "data"
+plotdir <- "plots"
+bamdir <- "/deepSeqData/bam"
+
+genome_file <- "/bioinfo/Genomes/mm39/mm39.fa"
+chrsizes_file <-"/bioinfo/Genomes/mm39/starIndex_v2_7_3a_mm39.woGTF/chrNameLength.txt"
+options(ucscChromosomeNames=FALSE)
+repeat_file <- "/bioinfo/Annotations/mm39/repeat_masker_s/GRCm39.primary_assembly.repMasker_sesitive.bed"
+genefile <- "/tungstenfs/groups/gbioinfo/DB/GENCODE/Mouse/release_M34/gencode.vM34.annotation.gtf"
+tRNAfile <- "/bioinfo/Annotations/mm39/tRNAs/mm39-tRNAs.bed" #(from GtRNAdb)
+
+```
+
+### load peaks
+
+```{r}
+POL3_peaks <- readRDS(file = file.path(topdir,datadir, "POL3_Peaks_filtered_1.2foldEnr_mq255.rds")) 
+```
+
+### prepare annotations
+
+```{r}
+
+#get rRNA annotations ()
+tRNAtab <- read.table(tRNAfile)
+names(tRNAtab) <- c("chr","start","end","tRNA_name","score","strand","s","e","V9","V10","V11","V12")
+tRNAs <- makeGRangesFromDataFrame(tRNAtab,
+                                 keep.extra.columns=TRUE,
+                                 ignore.strand=FALSE,
+                                 seqinfo=NULL,
+                                 seqnames.field=c("chr"),
+                                 start.field=c("start"),
+                                 end.field=c("end"),
+                                 strand.field=c("strand"),
+                                 starts.in.df.are.0based=TRUE)
+rm(tRNAtab)
+names(tRNAs) <- tRNAs$tRNA_name
+mcols(tRNAs) <- mcols(tRNAs)[-c(2,3,4,5,6,7,8)]
+
+
+#prepare gene annotations
+txdb.m34 <- txdbmaker::makeTxDbFromGFF(genefile, format=c("gtf"))
+genes <- genes(txdb.m34)
+
+TSSs <- promoters(genes,upstream=500,downstream=500)
+names(TSSs) <- matrix(unlist(strsplit(names(TSSs),".",fixed=TRUE)),ncol=2,byrow=TRUE)[,1]
+
+exons <- exons(txdb.m34)
+introns <- unlist(intronsByTranscript(txdb.m34))
+
+
+#prepare repeat annotations from repeat masker run
+repeats <- read.delim(repeat_file,header=FALSE)
+names(repeats) <- c("chr","start","end","repeat_name","swScore","strand","repeat_class","repeat_family","percDiv","percDel","percIns","repeat_class/family")
+#repeats <- repeats[complete.cases(repeats),]
+reps <- makeGRangesFromDataFrame(repeats,
+                                 keep.extra.columns=TRUE,
+                                 ignore.strand=FALSE,
+                                 seqinfo=NULL,
+                                 seqnames.field=c("chr"),
+                                 start.field=c("start"),
+                                 end.field=c("end"),
+                                 strand.field=c("strand"),
+                                 starts.in.df.are.0based=TRUE)
+
+#remove chromosomes not in combined genome
+chr_sizes <- read.table(chrsizes_file)
+chr_sizes$start <- 1
+chr_sizes <- makeGRangesFromDataFrame(chr_sizes,
+                                   keep.extra.columns=TRUE,
+                                   ignore.strand=TRUE,
+                                   seqinfo=NULL,
+                                   seqnames.field=c("V1"),
+                                   start.field=c("start"),
+                                   end.field=c("V2"),
+                                   starts.in.df.are.0based=FALSE)
+reps <- reps[overlapsAny(reps,chr_sizes,minoverlap = 1)==TRUE]
+names(reps) <- paste(reps$repeat_name,seqnames(reps),start(reps),end(reps),sep="_")
+
+rep.name2rep.class <- unique(data.frame(mcols(reps)[,c(1,3,4)]))
+
+LINEs <- reps[reps$repeat_class=="LINE"]
+LTRs <- reps[reps$repeat_class=="LTR"]
+SINEs <- reps[reps$repeat_class=="SINE"]
+DNAs <- reps[reps$repeat_class=="DNA"]
+otherReps <- reps[reps$repeat_class!="DNA" & reps$repeat_class!="SINE" & reps$repeat_class!="LTR" & reps$repeat_class!="LINE" & reps$repeat_class!="tRNA"]
+
+
+```
+
+# make lonely repeats GRanges
+
+```{r}
+# keep only proper repeats
+reps2 <- reps[reps$repeat_class %in% c("Simple_repeat","Unknown","Low_complexity","DNA?","ARTEFACT")==FALSE]
+
+#remove duplicated repeats
+reps2 <- reps2[!duplicated(names(reps2))]
+reps2$ID <- names(reps2)
+
+#POL3 transcribed repeats only
+repsP3 <- reps2[reps2$repeat_class=="SINE" | reps2$repeat_class=="tRNA"]
+
+#200bp upstream window
+reps2up <- promoters(reps2,upstream=200,downstream=0)
+reps2up <- promoters(reps2up,upstream=5,downstream=195)
+
+#200bp downstream window
+reps2down <- terminators(reps2,upstream=0,downstream=200)
+reps2down <- terminators(reps2down,upstream=195,downstream=5)
+
+#select reps that have no Pol3 transcribed rep up or downstream
+reps2$upstream <- overlapsAny(reps2up,repsP3,ignore.strand=TRUE)
+reps2$downstream <- overlapsAny(reps2down,repsP3,ignore.strand=TRUE)
+
+reps3 <- reps2[reps2$upstream==FALSE & reps2$downstream==FALSE]
+write_rds(reps3,file.path(topdir,datadir,"lonely_repeats_200bp_noSINEstRNAs.rds"))
+reps3 <- read_rds(file.path(topdir,datadir,"lonely_repeats_200bp_noSINEstRNAs.rds"))
+
+```
+
+### general overlap with genes, TSSs, repeats
+
+```{r}
+peakwidth <- 50
+data_4_upset <- data.frame(reps=as.integer(as.logical(overlapsAny(resize(POL3_peaks,width=peakwidth,fix="center"),reps,ignore.strand=TRUE))),
+exons=as.integer(as.logical(overlapsAny(resize(POL3_peaks,width=peakwidth,fix="center"),exons,ignore.strand=TRUE))),
+introns=as.integer(as.logical(overlapsAny(resize(POL3_peaks,width=peakwidth,fix="center"),introns,ignore.strand=TRUE))),
+TSSs=as.integer(as.logical(overlapsAny(resize(POL3_peaks,width=peakwidth,fix="center"),TSSs,ignore.strand=TRUE))),
+tRNAs=as.integer(as.logical(overlapsAny(resize(POL3_peaks,width=peakwidth,fix="center"),tRNAs,ignore.strand=TRUE)))
+)
+write.table(data_4_upset,file=file.path(topdir,datadir,"POL3_peaks_for_upset_plot_mq255_peakwith50.txt"),sep="\t",col.names=TRUE,row.names=FALSE,append=FALSE,quote=FALSE)
+
+pdf(file.path(topdir,plotdir,sprintf("POL3_peaks_overlaps_%d_reps_%d_peaks_mq255_peakwidth50.pdf",sum(data_4_upset$reps),nrow(data_4_upset))),height=5,width=5)
+upset(data_4_upset, nsets = 5, nintersects = 10, set_size.show = TRUE, order.by= "freq")
+dev.off()
+
+
+#with repeat classes 
+peakwidth <- 50
+peaks <- POL3_peaks[POL3_peaks$Pol3_ctrl_enr]
+data_4_upset2 <- data.frame(LINEs=as.integer(as.logical(overlapsAny(resize(peaks,width=peakwidth,fix="center"),LINEs,ignore.strand=TRUE))),
+LTRs=as.integer(as.logical(overlapsAny(resize(peaks,width=peakwidth,fix="center"),LTRs,ignore.strand=TRUE))),
+DNAs=as.integer(as.logical(overlapsAny(resize(peaks,width=peakwidth,fix="center"),DNAs,ignore.strand=TRUE))),
+SINEs=as.integer(as.logical(overlapsAny(resize(peaks,width=peakwidth,fix="center"),SINEs,ignore.strand=TRUE))),
+otherReps=as.integer(as.logical(overlapsAny(resize(peaks,width=peakwidth,fix="center"),otherReps,ignore.strand=TRUE))),
+exons=as.integer(as.logical(overlapsAny(resize(peaks,width=peakwidth,fix="center"),exons,ignore.strand=TRUE))),
+introns=as.integer(as.logical(overlapsAny(resize(peaks,width=peakwidth,fix="center"),introns,ignore.strand=TRUE))),
+TSSs=as.integer(as.logical(overlapsAny(resize(peaks,width=peakwidth,fix="center"),TSSs,ignore.strand=TRUE))),
+tRNAs=as.integer(as.logical(overlapsAny(resize(peaks,width=peakwidth,fix="center"),tRNAs,ignore.strand=TRUE)))
+)
+
+pdf(file.path(topdir,plotdir,sprintf("POL3_ctrl_peaks_overlaps_%d_reps_%d_peaks_mq255_peakwidth50_splitByRepClass.pdf",sum(data_4_upset2$reps),nrow(data_4_upset2))),height=5,width=5)
+upset(data_4_upset2, nsets = 9, nintersects = 16, set_size.show = TRUE, order.by= "freq")
+dev.off()
+
+
+
+```
+
+
+# FUNCTIONS
+
+###  comparison to repeat name annotation
+
+```{r}
+
+nreps_with_peaks_function <- function(reps=reps,POL3_peaks=POL3_peaks,whichPeaks,whichPeaksName,peakwidth=50,npeaks=50){
+  
+selPeaks <- POL3_peaks[whichPeaks,]
+
+#select the repeats that overlap peaks
+#reps.Adnp <- reps[overlapsAny(reps,resize(selPeaks,width=100,fix="center"))]
+reps2peaks <- findOverlaps(reps,resize(selPeaks,width=peakwidth,fix="center"),ignore.strand=TRUE)
+reps.peaks <- reps[from(reps2peaks)]
+peaks.reps <- selPeaks[to(reps2peaks)]
+reps.peaks$peakID <- names(peaks.reps)
+
+# remove the repeats that overlap the same peak, keep the onles that have a low percDiv and percIns and percDel
+dup.peakIDs <- unique(reps.peaks$peakID[duplicated(reps.peaks$peakID)])
+
+reps.peaks$score <- reps.peaks$percDiv*2 + reps.peaks$percDel + reps.peaks$percIns
+uni.reps.peaks <- reps.peaks[reps.peaks$peakID %in% dup.peakIDs ==FALSE]
+for (p in seq_along(dup.peakIDs)){
+  sel.reps <- reps.peaks[reps.peaks$peakID==dup.peakIDs[p]]
+  uni.reps.peaks <- c(uni.reps.peaks,sel.reps[sel.reps$score < (min(sel.reps$score)+5)])
+}
+
+#generate a set of repeats that overlap n random peak sets
+reps.random <- list()
+for (i in 1:npeaks){
+  random.peaks <- SimulatePeaks(length(selPeaks),peak.widths = peakwidth,chromosomeSizes = chrsizes_file)
+  #select the repeats that overlap it
+  reps2rpeaks <- findOverlaps(reps,random.peaks,ignore.strand=TRUE)
+  reps.rpeaks <- reps[from(reps2rpeaks)]
+  rpeaks.reps <- random.peaks[to(reps2rpeaks)]
+  reps.rpeaks$peakID <- names(rpeaks.reps)
+  
+# remove the repeats that overlap the same peak, keep the onles that have a low percDiv and percIns and percDel
+dup.rpeakIDs <- unique(reps.rpeaks$peakID[duplicated(reps.rpeaks$peakID)])
+
+reps.rpeaks$score <- reps.rpeaks$percDiv*2 + reps.rpeaks$percDel + reps.rpeaks$percIns
+uni.reps.rpeaks <- reps.rpeaks[reps.rpeaks$peakID %in% dup.rpeakIDs ==FALSE]
+for (p in seq_along(dup.rpeakIDs)){
+  sel.rreps <- reps.rpeaks[reps.rpeaks$peakID==dup.rpeakIDs[p]]
+  uni.reps.rpeaks <- c(uni.reps.rpeaks,sel.rreps[sel.rreps$score < (min(sel.rreps$score)+5)])
+}
+reps.random[[i]] <- uni.reps.rpeaks
+}
+
+#calculate the number of each repeat_name in each repeat set 
+reps.tables <- list()
+for (i in 1:npeaks){
+  reps.tables[[i]] <- data.frame(table(reps.random[[i]]$repeat_name))
+}
+
+#merge the data.frames  
+rep_table_random <- Reduce(
+  function(x, y, ...) merge(x, y, all = TRUE, by="Var1",...),
+  reps.tables
+)
+#replace all NAs with 0s
+colnames(rep_table_random) <- c("repeat_name",paste("random",1:npeaks,sep="."))
+list(random.1=0,random.2=0)
+replacelist <- vector(mode = "list", length = npeaks)
+names(replacelist) <- colnames(rep_table_random)[-1]
+replacelist <- lapply(replacelist,function(x){x <- 0})
+rep_table_random2 <- replace_na(rep_table_random,replace = replacelist)
+
+#calculate the mean and sd
+rep_table_random3 <- data.frame(Var1=rep_table_random2$repeat_name,
+                                mean.random=apply(rep_table_random2[,-1],1,mean),
+                                sd.random=apply(rep_table_random2[,-1],1,sd)
+)
+
+#count them based on repeat name, compare in scatter plot
+rep.name.distribution <- left_join(data.frame(table(uni.reps.peaks$repeat_name)),rep_table_random3,
+                                   by="Var1")
+colnames(rep.name.distribution) <- c("repeat_name","Pol3","random","sd")
+rep.name.distribution$random <- replace_na(data = rep.name.distribution$random,replace = 0)
+rep.name.distribution$sd <- replace_na(data = rep.name.distribution$sd,replace = 0)
+
+#add rep class
+rep.name.distribution <- left_join(rep.name.distribution,rep.name2rep.class,by="repeat_name")
+#rep.name.distribution$repeat.class <- matrix(unlist(strsplit(rep.name.distribution$repeat_class,"/",fixed=TRUE)),ncol=2,byrow=TRUE)[,1]
+
+#save results as table
+write.table(rep.name.distribution,file.path(topdir,datadir,sprintf("repeat_names_andTSS_at_%s_POL3_vs_random_peaks_mq255.txt",whichPeaksName)),sep="\t",col.names=TRUE,row.names=FALSE,append=FALSE,quote=FALSE)
+}
+```
+
+# overlap of peaks with different repeat classes - barplot
+
+```{r}
+
+repoverlapBarplotFunction <- function(whichPeaksName){
+repoverlap <- read.table(file.path(topdir,datadir,sprintf("repeat_names_andTSS_at_%s_POL3_vs_random_peaks_mq255.txt",whichPeaksName)),sep="\t",header=TRUE)
+colnames(repoverlap) <- c("repeat_name", "peak", "random", "sd",  "repeat_class","repeat_family")
+repoverlap$repclass <- ifelse(grepl("^TSS",repoverlap$repeat_class),"TSS",
+                              ifelse(grepl("^DNA",repoverlap$repeat_class),"DNA",
+                              ifelse(grepl("RNA",repoverlap$repeat_class),"RNA",
+                                     ifelse(grepl("^LINE",repoverlap$repeat_class),"LINE",
+                                         ifelse(grepl("^LTR",repoverlap$repeat_class),"LTR",
+                                                ifelse(grepl("^SINE",repoverlap$repeat_class),"SINE",
+                                                       ifelse(grepl("Satellite",repoverlap$repeat_class),"Satellite",
+                                                              ifelse(repoverlap$repeat_class=="Simple_repeat" | repoverlap$repeat_class=="Low_complexity","Simple/low_complexity","other"))))))))
+table(repoverlap$repclass)
+
+#summarize the repeat overlaps by repeat class
+repoverlap2 <- repoverlap %>% group_by(repclass) %>% summarize(peak=sum(peak),random=sum(random)) %>% pivot_longer(cols = c("peak", "random"),names_to = "peaktype",values_to = "number_of_repeats")
+
+#sort by number of peaks overlapping
+repoverlap3 <- repoverlap2[repoverlap2$peaktype=="peak",]
+repoverlap3 <- repoverlap3[order(repoverlap3$number_of_repeats,decreasing=TRUE),]
+repoverlap2$repclass <- factor(repoverlap2$repclass,levels=repoverlap3$repclass,labels=repoverlap3$repclass)
+
+#plot
+ggplot(repoverlap2,aes(y=number_of_repeats,x=repclass,fill=peaktype)) + geom_bar(stat="identity",position = "dodge") + 
+  theme_classic() + scale_fill_manual(values = c("#009444","#bcbec0")) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ggsave(filename=file.path(topdir,plotdir,sprintf("repeat_names_andTSS_at_%s_POL3_peaks_barplot_mq255.pdf",whichPeaksName)),height=4, width=6,device = "pdf")
+}
+```
+
+
+
+# detailed overlap of peaks with different repeat elements
+
+```{r}
+repoverlapScatterplotFunction <- function(whichPeaksName){
+repoverlap <- read.table(file.path(topdir,datadir,sprintf("repeat_names_andTSS_at_%s_POL3_vs_random_peaks_mq255.txt",whichPeaksName)),sep="\t",header=TRUE)
+colnames(repoverlap) <- c("repeat_name", "peak", "random", "sd",  "repeat_class","repeat_family")
+repoverlap$label <- ifelse(repoverlap$peak > 100 & repoverlap$random < 3000,repoverlap$repeat_name,"" )
+repoverlap$repclass <- ifelse(grepl("^TSS",repoverlap$repeat_class),"TSS",
+                              ifelse(grepl("^DNA",repoverlap$repeat_class),"DNA",
+                              ifelse(grepl("RNA",repoverlap$repeat_class),"RNA",
+                                     ifelse(grepl("^LINE",repoverlap$repeat_class),"LINE",
+                                         ifelse(grepl("^LTR",repoverlap$repeat_class),"LTR",
+                                                ifelse(grepl("^SINE",repoverlap$repeat_class),"SINE",
+                                                       ifelse(grepl("Satellite",repoverlap$repeat_class),"Satellite",
+                                                              ifelse(repoverlap$repeat_class=="Simple_repeat" | repoverlap$repeat_class=="Low_complexity","Simple/low_complexity","other"))))))))
+table(repoverlap$repclass)
+
+#plot
+ggplot(repoverlap,aes(y=peak,x=random,col=repclass)) + geom_point() + theme_classic() +
+ # geom_text(aes(label=ifelse(peak > 200 & random < 50,as.character(repeat_name),'')),hjust=0.5,vjust=-0.7,size=2) +
+  geom_text(aes(label=label),hjust=0.1,vjust=-0.5,size=4) +
+  #xlim(0,1000) + ylim(0,1000) + 
+  # scale_color_discrete()  + 
+  geom_errorbarh(aes(xmax = random + sd, xmin = random - sd, height = 5)) +
+  geom_abline(slope = 1, intercept = 0,col="#bcbec0",linetype="dotted") + scale_color_manual(values = c("TSS" ="#997950FF" ,
+                                "DNA"="#E27069FF","RNA"="#DBA520FF","LINE"="#E93FBCFF","LTR"="#2E8B57FF",
+                               "SINE"="#1175BBFF","Satellite"="#7852A9FF","Simple/low_complexity"="#4AC6AEFF","other"= "#EF7215FF"))
+
+ggsave(filename=file.path(topdir,plotdir,sprintf("repeat_names_andTSS_at_%s_POL3_vs_random_peaks_mq255.pdf",whichPeaksName)),height=6, width=8,device = "pdf")
+}
+```
+
+# run the repeat overlap functions for all peak sets
+
+```{r}
+peaksets <- grep("_enr",colnames(mcols(POL3_peaks)),value=TRUE)
+for (p in seq_along(peaksets)){
+whichPeaks <- which(mcols(POL3_peaks)[,peaksets[p]] == TRUE)
+whichPeaksName <- peaksets[p]
+whichPeaksName_lonely <- gsub("enr","lonely",peaksets[p])
+
+# all repeats
+nreps_with_peaks_function(reps2,POL3_peaks,whichPeaks,whichPeaksName)
+repoverlapBarplotFunction(whichPeaksName)
+repoverlapScatterplotFunction(whichPeaksName)
+
+# lonely repeats
+nreps_with_peaks_function(reps3,POL3_peaks,whichPeaks,whichPeaksName_lonely)
+repoverlapBarplotFunction(whichPeaksName_lonely)
+repoverlapScatterplotFunction(whichPeaksName_lonely)
+}
+
+```
+
+# compare the number of repeats with peaks in dTAG timecourse
+
+```{r}
+repoverlap <- read.table(file.path(topdir,datadir,"repeat_names_andTSS_at_AdnpFKBP_ctrl_enr_POL3_vs_random_peaks_mq255.txt"),sep="\t",header=TRUE)
+repoverlap2 <- read.table(file.path(topdir,datadir,"repeat_names_andTSS_at_AdnpFKBP_4h_enr_POL3_vs_random_peaks_mq255.txt"),sep="\t",header=TRUE)
+colnames(repoverlap2)[-1] <- paste("dTAG4h",colnames(repoverlap2)[-1],sep="_")
+repoverlap3 <- read.table(file.path(topdir,datadir,"repeat_names_andTSS_at_AdnpFKBP_24h_enr_POL3_vs_random_peaks_mq255.txt"),sep="\t",header=TRUE)
+colnames(repoverlap3)[-1] <- paste("dTAG24h",colnames(repoverlap3)[-1],sep="_")
+
+repoverlap <- left_join(repoverlap,repoverlap2,by="repeat_name")
+repoverlap <- left_join(repoverlap,repoverlap3,by="repeat_name")
+
+repoverlap$ChIP <- "POL3"
+#colnames(repoverlap) <- c("repeat_name", "peak", "random", "sd",  "repeat_class","ChIP")
+repoverlap$label <- ifelse(repoverlap$ChIP=="POL3" & repoverlap$Pol3 > 300 & repoverlap$random < 3000,repoverlap$repeat_name,"" )
+repoverlap$repclass <- ifelse(grepl("^TSS",repoverlap$repeat_class),"TSS",
+                              ifelse(grepl("^DNA",repoverlap$repeat_class),"DNA",
+                              ifelse(grepl("RNA",repoverlap$repeat_class),"RNA",
+                                     ifelse(grepl("^LINE",repoverlap$repeat_class),"LINE",
+                                         ifelse(grepl("^LTR",repoverlap$repeat_class),"LTR",
+                                                ifelse(grepl("^SINE",repoverlap$repeat_class),"SINE",
+                                                       ifelse(grepl("Satellite",repoverlap$repeat_class),"Satellite",
+                                                              ifelse(repoverlap$repeat_class=="Simple_repeat" | repoverlap$repeat_class=="Low_complexity","Simple/low_complexity","other"))))))))
+table(repoverlap$repclass)
+
+#plot
+require(ggrepel)
+
+p1 <- ggplot(repoverlap,aes(x=Pol3,y=dTAG4h_Pol3,col=repclass)) + geom_point() + theme_classic() +
+  geom_text_repel(aes(label=label),hjust=0.1,vjust=-0.5,size=4) +
+  xlim(0,1300) + ylim(0,2600) + 
+  # scale_color_discrete()  + 
+  geom_abline(slope = 1, intercept = 0,col="#bcbec0",linetype="dotted") +
+  facet_wrap(vars(ChIP),scales="free") + scale_color_manual(values = c("TSS" ="#997950FF" ,
+                                "DNA"="#E27069FF","RNA"="#DBA520FF","LINE"="#E93FBCFF","LTR"="#2E8B57FF",
+                               "SINE"="#1175BBFF","Satellite"="#7852A9FF","Simple/low_complexity"="#4AC6AEFF","other"= "#EF7215FF"))
+
+p2 <- ggplot(repoverlap,aes(x=Pol3,y=dTAG24h_Pol3,col=repclass)) + geom_point() + theme_classic() +
+  geom_text_repel(aes(label=label),hjust=0.1,vjust=-0.5,size=4) +
+  xlim(0,1300) + ylim(0,2600) + 
+  # scale_color_discrete()  + 
+  geom_abline(slope = 1, intercept = 0,col="#bcbec0",linetype="dotted") +
+  facet_wrap(vars(ChIP),scales="free") + scale_color_manual(values = c("TSS" ="#997950FF" ,
+                                "DNA"="#E27069FF","RNA"="#DBA520FF","LINE"="#E93FBCFF","LTR"="#2E8B57FF",
+                               "SINE"="#1175BBFF","Satellite"="#7852A9FF","Simple/low_complexity"="#4AC6AEFF","other"= "#EF7215FF"))
+
+plot_grid(p1,p2)
+ggsave(filename=file.path(topdir,plotdir,"repeat_names_andTSS_at_ADNPdTAG_POL3_vs_ctrl_peaks_mq255.pdf"),height=4, width=12,device = "pdf")
+```
+
+
