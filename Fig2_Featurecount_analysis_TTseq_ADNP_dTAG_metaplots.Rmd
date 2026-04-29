@@ -1,0 +1,201 @@
+---
+title: "Featurecounts TE analysis ADNP depletion TTseq metaplots"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+## prepare parameters
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(GenomicRanges)
+  library(Rsubread)
+  library(ggrepel)
+  library(GenomicFeatures)
+  library(dplyr)
+  library(TxDb.Mmusculus.GENCODE.GRCm39.gencodeM34)
+  library(patchwork)
+})
+
+#parameters
+topdir <-  "michi/Projects/Adnp/Pol3_mm39/manuscript/"
+data <- "data/"
+plots <- "plots/"
+
+datadir <- paste(topdir,data, sep = "")
+plotdir <- paste(topdir,plots, sep = "")
+#mm39 genes
+gene_file <- "DB/GENCODE/Mouse/release_M34/gencode.vM34.annotation.gtf"
+
+```
+
+
+# get expressed genes, min length > 2000bp
+
+```{r}
+txdb <- TxDb.Mmusculus.GENCODE.GRCm39.gencodeM34
+gene_bodies <- genes(txdb)  # returns one range per gene = full start:end span
+gene_counts <- read.table(paste(datadir, "TTseq_feature_counts_per_genebody_mq255.txt", sep = ""))
+gene_counts <- gene_counts[rowSums(gene_counts) > 10,]
+gene_bodies <- gene_bodies[gene_bodies$gene_id %in% row.names(gene_counts)]
+gene_bodies <- gene_bodies[width(gene_bodies)>2000]
+
+# remove genes closer than 5kb to chromosome start (will generate negative start coordinates)
+gene_bodies <- gene_bodies[start(gene_bodies)>5000]
+```
+
+# load bam Files
+
+```{r}
+# prep bam files
+all.bamFiles <- list.files("deepSeqData/bam/", full.names=TRUE,pattern="*bam$")
+ADNP_FKBP_RNAseq <- c(grep("4251F",all.bamFiles,value=TRUE)) ## TTseq for 0,1,4,24h of ADNP depletion
+
+bamFilesR <- ADNP_FKBP_RNAseq
+
+bamNamesR <- gsub("deepSeqData/bam//","",bamFilesR)
+bamNamesR <- gsub("_RS_Aligned.sortedByCoord.out.bam","",bamNamesR)
+bamNamesR <- sapply(strsplit(bamNamesR, "_"), function(x) paste(x[-6], collapse = "_"))
+
+# keep only 4E clone samples, drop spikein bam files
+keep <- grepl("ADNP_4E", bamNamesR) & !grepl("spikein", bamNamesR)
+
+bamFilesR <- bamFilesR[keep]
+bamNamesR <- bamNamesR[keep]
+```
+
+# prepare gene bins
+
+```{r}
+nbins_flank <- 50   # bins for each flank
+nbins_body  <- 100  # bins for gene body
+
+# Tile each gene body separately, then add flanks
+upstream   <- tile(flank(gene_bodies, width = 5000, start = TRUE),  n = nbins_flank)
+genebody   <- tile(gene_bodies, n = nbins_body)
+downstream <- tile(flank(gene_bodies, width = 5000, start = FALSE), n = nbins_flank)
+
+#make a saf for feature counts
+bins_to_saf <- function(tile_list, gene_ids, bin_offset) {
+  df <- as.data.frame(unlist(tile_list), row.names = NULL)  # <-- add row.names = NULL
+  df$gene_idx <- rep(seq_along(gene_ids), lengths(tile_list))
+  df$bin      <- sequence(lengths(tile_list))  # bin number within region
+  df$bin      <- df$bin + bin_offset
+  df$GeneID   <- paste0(gene_ids[df$gene_idx], "_bin", df$bin)
+  df$Chr      <- df$seqnames
+  df$Start    <- df$start
+  df$End      <- df$end
+  df$Strand   <- df$strand
+  df[, c("GeneID", "Chr", "Start", "End", "Strand", "gene_idx", "bin")]
+}
+
+gene_ids <- names(gene_bodies)  # or mcols(your_granges)$gene_id
+
+saf_up   <- bins_to_saf(upstream,   gene_ids, bin_offset = 0)
+saf_body <- bins_to_saf(genebody,   gene_ids, bin_offset = nbins_flank)
+saf_down <- bins_to_saf(downstream, gene_ids, bin_offset = nbins_flank + nbins_body)
+
+saf_all <- bind_rows(saf_up, saf_body, saf_down)
+
+#reverse - strand bin order for each of the 3 regions seperately
+saf_all <- saf_all %>%
+  mutate(region = case_when(
+    bin <= nbins_flank                          ~ "upstream",
+    bin <= nbins_flank + nbins_body             ~ "body",
+    TRUE                                        ~ "downstream"
+  )) %>%
+  group_by(gene_idx, region) %>%
+  mutate(bin = ifelse(as.character(Strand) == "-", rev(bin), bin)) %>%
+  ungroup()
+```
+
+# count reads in bins
+
+```{r}
+fc <- featureCounts(
+  files            = bamFilesR,
+  annot.ext        = saf_all[, c("GeneID","Chr","Start","End","Strand")],
+  isGTFAnnotationFile = FALSE,
+  useMetaFeatures  = FALSE,
+  allowMultiOverlap = TRUE,
+  isPairedEnd      = TRUE,   
+  minOverlap           = 1,
+  countMultiMappingReads = FALSE,     # unique mappers only
+  minMQS               = 255,         # unique mappers only
+  strandSpecific       = 2,           # strand setting
+  nthreads             = 20
+)
+```
+
+# calculate cpms
+
+```{r}
+counts_mat <- fc$counts  # rows = bins, cols = samples
+colnames(counts_mat) <- bamNamesR
+lib_sizes   <- colSums(counts_mat)
+cpm_mat     <- sweep(counts_mat, 2, lib_sizes / 1e6, FUN = "/")
+
+# Add bin metadata back
+cpm_df <- as.data.frame(cpm_mat)
+cpm_df$GeneID   <- rownames(cpm_df)
+cpm_df <- left_join(cpm_df, saf_all[, c("GeneID","bin","gene_idx")], by = "GeneID")
+
+# Average CPM per bin across all genes
+profile <- cpm_df %>%
+  group_by(bin) %>%
+  summarise(across(bamNamesR, mean, na.rm = TRUE))
+```
+
+# metaplot
+
+```{r}
+total_bins <- nbins_flank + nbins_body + nbins_flank
+
+profile_long <- profile %>%
+  tidyr::pivot_longer(-bin, names_to = "sample", values_to = "cpm")
+
+ggplot(profile_long, aes(x = bin, y = cpm, color = sample)) +
+  geom_line() +
+  geom_vline(xintercept = c(nbins_flank, nbins_flank + nbins_body), 
+             linetype = "dashed", color = "grey50") +
+  scale_x_continuous(
+    breaks = c(0, nbins_flank, nbins_flank + nbins_body, total_bins),
+    labels = c("-5kb", "TSS", "TES", "+5kb")
+  ) +
+  labs(x = "Genomic region", y = "CPM") +
+  theme_classic()
+```
+
+# metaplot with replicates merged
+
+```{r, fig.height=2, fig.width=8}
+#average replicates
+profile_long$group <- gsub("_r[1,2,3]","",profile_long$sample)
+profile_long2 <- profile_long %>% group_by(bin,group) %>% summarise(cpm=mean(cpm))
+profile_long2$group <- ifelse(profile_long2$group =="ADNP_4E_DMSO_24h", "Control",
+                         ifelse(profile_long2$group =="ADNP_4E_dTAG_1h", "1h ADNP depl.",
+                                ifelse(profile_long2$group =="ADNP_4E_dTAG_4h", "4h ADNP depl.",
+                                       ifelse(profile_long2$group =="ADNP_4E_dTAG_24h", "24h ADNP depl.",""))))
+
+fill_values <- c(
+    "Control" = "#bcbec0", 
+    "24h ADNP depl." = "#3aa3db", 
+    "4h ADNP depl." = "#6cbad6", 
+    "1h ADNP depl." = "#7fd2e8"
+  )
+
+ggplot(profile_long2, aes(x = bin, y = cpm, color = group)) +
+  geom_line() +
+  geom_vline(xintercept = c(nbins_flank, nbins_flank + nbins_body), 
+             linetype = "dashed", color = "grey50") +
+  scale_x_continuous(
+    breaks = c(0, nbins_flank, nbins_flank + nbins_body, total_bins),
+    labels = c("-5kb", "TSS", "TES", "+5kb")
+  ) +
+  labs(x = "Genomic region", y = "CPM") +
+  theme_classic() + scale_color_manual(values=fill_values)
+ggsave(file.path(plotdir,"TTseq_gene_metaplots.pdf"),height=2,width=8)
+```
+

@@ -1,0 +1,205 @@
+---
+title: "SINE find results"
+author: "Michaela Schwaiger"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+#libraries
+suppressPackageStartupMessages({
+  library(GenomicRanges)
+library(tidyverse)
+  library(patchwork)
+  library(ggrastr)
+})
+
+topdir <- "michi/Projects/Adnp/Pol3_mm39/manuscript"
+datadir <- "data"
+plotdir <- "plots"
+bamdir <- "deepSeqData/bam"
+
+genome_file <- "bioinfo/Genomes/mm39/mm39.fa"
+chrsizes_file <-"bioinfo/Genomes/mm39/starIndex_v2_7_3a_mm39.woGTF/chrNameLength.txt"
+repeat_file <- "bioinfo/Annotations/mm39/repeat_masker_s/GRCm39.primary_assembly.repMasker_sesitive.bed"
+SINEsFind_path <- "michi/Projects/Adnp/Pol3_mm39/manuscript/python_code/"
+```
+
+# load  SINEs
+
+```{r}
+#prepare repeat annotations from repeat masker run
+repeats <- read.delim(repeat_file,header=FALSE)
+#names(repeats) <- c("chr","start","end","repeat_name","swScore","strand","percDiv","percDel","percIns","genome_left","repeat_class","rep_start","rep_end","rep_left","ID")
+names(repeats) <- c("chr","start","end","repeat_name","swScore","strand","repeat_class","repeat_family","percDiv","percDel","percIns","repeat_class/family")
+#repeats <- repeats[complete.cases(repeats),]
+reps <- makeGRangesFromDataFrame(repeats,
+                                 keep.extra.columns=TRUE,
+                                 ignore.strand=FALSE,
+                                 seqinfo=NULL,
+                                 seqnames.field=c("chr"),
+                                 start.field=c("start"),
+                                 end.field=c("end"),
+                                 strand.field=c("strand"),
+                                 starts.in.df.are.0based=TRUE)
+
+#remove chromosomes not in combined genome
+chr_sizes <- read.table(chrsizes_file)
+chr_sizes$start <- 1
+chr_sizes <- makeGRangesFromDataFrame(chr_sizes,
+                                   keep.extra.columns=TRUE,
+                                   ignore.strand=TRUE,
+                                   seqinfo=NULL,
+                                   seqnames.field=c("V1"),
+                                   start.field=c("start"),
+                                   end.field=c("V2"),
+                                   starts.in.df.are.0based=FALSE)
+reps <- reps[overlapsAny(reps,chr_sizes,minoverlap = 1)==TRUE]
+SINEs <- reps[reps$repeat_class =="SINE"]
+
+SINE_names <- c("B2_Mm1a","B2_Mm1t","B2_Mm2","B3","B3A","B1_Mm","B1_Mus1","B1_Mus2","MIR","MIRb")
+SINE_B2s <- SINEs[SINEs$repeat_name %in% SINE_names]
+
+#optinal: only B2s!
+#SINE_B2s <- SINE_B2s[SINE_B2s$repeat_family=="B2"]
+
+# Create unique gene_id and transcript_id for each SINE locus
+mcols(SINE_B2s)$id <- paste0(
+  mcols(SINE_B2s)$repeat_name, "_",
+  seqnames(SINE_B2s), "_",
+  start(SINE_B2s), "_",
+  end(SINE_B2s)
+)
+
+```
+
+# load results
+
+```{r}
+SINEsFind_files <- list.files(path=SINEsFind_path,pattern = "B2_B1_MIR_sines_Adnp_RNAseq_",full.names = TRUE)
+SINEsFind_files <- grep("sinesfind$",SINEsFind_files,value = TRUE)
+SINEsFind_names <- gsub("michi/Projects/Adnp/Pol3_mm39/manuscript/python_code//B2_B1_MIR_sines_Adnp_RNAseq_","",SINEsFind_files)
+SINEsFind_names <- gsub("_sinesfind","",SINEsFind_names)
+
+for (i in seq_along(SINEsFind_files)){
+res1 <- read.table(SINEsFind_files[i],header=TRUE)
+mcols(SINE_B2s)[SINEsFind_names[i]] <- SINE_B2s$id %in% res1$Name
+}
+```
+
+# load POL3 quantification per SINE and combine with SINE find results
+
+```{r}
+SINE_enr <- readRDS(file=file.path(topdir, datadir,"all_enrichments_SINEs_tRNAs_snRNAs_rRNAs_50upstream.rds"))
+
+SINE_POL3 <- data.frame(id=names(SINE_enr),POL3_ctrl=SINE_enr$POL3_ctrl,POL3_24h=SINE_enr$POL3_24h)
+
+
+SINE_find_POL3 <- left_join(data.frame(mcols(SINE_B2s)),SINE_POL3,by="id")
+
+#combine SINE-find replicates
+SINE_find_POL3$DMSO_24h <- ifelse(rowSums(SINE_find_POL3[,grep("DMSO_24h",colnames(SINE_find_POL3))]) >=2,"expressed","not_expressed")
+SINE_find_POL3$dTAG_24h <- ifelse(rowSums(SINE_find_POL3[,grep("dTAG_24h",colnames(SINE_find_POL3))]) >=2,"expressed","not_expressed")
+
+table(SINE_find_POL3$DMSO_24h)
+table(SINE_find_POL3$dTAG_24h)
+
+```
+
+# plot to POL3 enrichment
+
+```{r}
+p1 <- ggplot(SINE_find_POL3, aes(x=DMSO_24h, y=POL3_ctrl)) + 
+  geom_boxplot() + 
+  facet_wrap(vars(repeat_name)) + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  stat_summary(fun.data = function(x) {
+    return(data.frame(y = max(x) * 1.1, 
+                      label = paste0("n=", length(x))))
+  }, geom = "text", size = 3)
+
+p2 <- ggplot(SINE_find_POL3, aes(x=dTAG_24h, y=POL3_ctrl)) + 
+  geom_boxplot() + 
+  facet_wrap(vars(repeat_name)) + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  stat_summary(fun.data = function(x) {
+    return(data.frame(y = max(x) * 1.1, 
+                      label = paste0("n=", length(x))))
+  }, geom = "text", size = 3)
+p1 + p2
+ggsave(file.path(topdir,plotdir,"SINEs_find_vs_POl3_binding_boxplots_SINE_B2_B1_MIRs.pdf"),height=6, width=12)
+```
+
+# find differential SINEs from SInesfind
+
+```{r}
+SINE_find_POL3$regulated_24h <- ifelse(SINE_find_POL3$dTAG_24h =="expressed" & SINE_find_POL3$DMSO_24h == "not_expressed", "expr_dTAG",
+                                ifelse(SINE_find_POL3$dTAG_24h =="not_expressed" & SINE_find_POL3$DMSO_24h == "expressed", "expr_DMSO",
+                                ifelse(SINE_find_POL3$dTAG_24h =="expressed" & SINE_find_POL3$DMSO_24h == "expressed", "expr_dTAG_and_DMSO","not_expressed")))
+SINEs_n <- table(SINE_find_POL3$repeat_name,SINE_find_POL3$regulated_24h)
+write.table(SINEs_n,file= file.path(topdir,datadir,"SINEsFind_results_summary.txt"),col.names=TRUE,row.names=TRUE,append=FALSE, quote=FALSE)
+
+table(SINE_find_POL3$repeat_family,SINE_find_POL3$regulated_24h)
+
+```
+
+```{r}
+B1s_POL3 <- rbind(SINE_find_POL3[SINE_find_POL3$repeat_name=="B1_Mm" & SINE_find_POL3$POL3_ctrl > 2,],
+SINE_find_POL3[SINE_find_POL3$repeat_name=="B1_Mus1" & SINE_find_POL3$POL3_ctrl > 2,],
+SINE_find_POL3[SINE_find_POL3$repeat_name=="B1_Mus2" & SINE_find_POL3$POL3_ctrl > 2,])
+write.table(B1s_POL3,file= file.path(topdir,datadir,"B1s_with_POL3.txt"),col.names=TRUE,row.names=FALSE,append=FALSE, quote=FALSE)
+
+```
+
+# compare to differential POL3 enrichments on lonely SINEs
+
+```{r}
+# load POL3 results
+res2 <- read.table(file=file.path(topdir,datadir,"POL3ChIP_edgeR_comparison_ADNP_dTAGs_noSINE_tRNA_in100bp_updown_fcounts_SINEs.txt"),sep="\t",header=TRUE)
+
+#combine
+SINE_find_POL3_DE <- inner_join(SINE_find_POL3,res2[res2$Contrast=="POL3_24h_ADNP_dTAG_vs_ctrl",],by=c("id"="ID"))
+
+fill_values <- c(
+    "not_expressed" = "#bcbec0", 
+    "expr_dTAG_and_DMSO" = "#1b9e77", 
+    "expr_dTAG" = "#7570b3", 
+    "expr_DMSO" = "#d95f02"
+  )
+
+trans_values <- c( "not_expressed" = 0.3, 
+    "expr_dTAG_and_DMSO" = 0.7, 
+    "expr_dTAG" = 0.7, 
+    "expr_DMSO" = 0.7)
+
+#Volcanoplot
+vpa <- ggplot(SINE_find_POL3_DE,aes(x=logFC,y=logadjPval,col=regulated_24h,alpha=regulated_24h)) + geom_point() + theme_classic() 
+vpa <- vpa + geom_vline(xintercept=c(-1,1),alpha=0.4) + geom_hline(yintercept = 2,alpha=0.4)
+vpa + scale_color_manual(values=fill_values) + scale_alpha_manual(values=trans_values)
+ggsave(file.path(topdir,plotdir,"POL3ChIP_edgeR_comparison_ADNP_dTAGs_volcanoPlot_noSINE_tRNA_in100bp_updown_SINEfind_regulated_colored.pdf"),device="pdf",height=5,width=8)
+
+```
+
+# MA plot
+
+```{r}
+
+#ggplot(SINE_find_POL3_DE,aes(x=POL3_ctrl,y=POL3_24h,col=regulated_24h)) + geom_point() + theme_classic() 
+ggplot(SINE_find_POL3_DE,aes(x=logCPM,y=logFC,col=regulated_24h,alpha=regulated_24h)) + geom_point_rast(size = 3.5, stroke = 0) + theme_classic() + scale_color_manual(values=fill_values) + scale_alpha_manual(values=trans_values) + geom_hline(yintercept = 0,alpha=0.4,linetype="dashed") 
+ggsave(file.path(topdir,plotdir,"POL3ChIP_edgeR_comparison_ADNP_dTAGs_MAPlot_noSINE_tRNA_in100bp_updown_SINEfind_regulated_colored.pdf"),device="pdf",height=5,width=9)
+```
+
+# save table of expressed SINEs
+
+```{r}
+SINE_find_POL3_DE_expr <- SINE_find_POL3_DE[SINE_find_POL3_DE$regulated_24h != "not_expressed",]
+ggplot(SINE_find_POL3_DE_expr,aes(x=logCPM,y=logFC,col=regulated_24h,alpha=regulated_24h)) + geom_point() + theme_classic() + scale_color_manual(values=fill_values) + scale_alpha_manual(values=trans_values) 
+
+SINE_find_POL3_DE_expr <- SINE_find_POL3_DE_expr[,c(9,1,30:34,36,37,28,29)]
+colnames(SINE_find_POL3_DE_expr) <- c("id" ,"repeat_name" ,  "SINEsfind_DMSO_24h" , "SINEsfind_dTAG_24h","SINEsfind_regulated_24h", "POL3_logFC" , "POL3_logCPM",      "POL3_PValue","POL3_FDR","POL3_DMSO_24h","POL3_dTAG_24h" )
+write.table(SINE_find_POL3_DE_expr,file=file.path(topdir,datadir,"POL3ChIP_edgeR_comparison_ADNP_dTAGs_noSINE_tRNA_in100bp_updown_SINEfind_expressed.txt"),col.names=TRUE,row.names=FALSE, sep="\t",append=FALSE, quote=FALSE)
+```
+
